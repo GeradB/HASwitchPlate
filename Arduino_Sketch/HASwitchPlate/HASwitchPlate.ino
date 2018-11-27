@@ -32,11 +32,11 @@ char wifiPass[64] = ""; // Note that these values will be lost if auto-update is
                         // and that's probably OK because they will be saved in EEPROM.
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-char mqttServer[64] = ""; // These defaults may be overwritten with values saved by the web interface
+char mqttServer[64] = "192.168.1.10"; // These defaults may be overwritten with values saved by the web interface
 char mqttPort[6] = "1883";
 char mqttUser[32] = "";
 char mqttPassword[32] = "";
-char haspNode[16] = "plate01";
+char haspNode[16] = "plate02";
 char groupName[16] = "plates";
 char configUser[32] = "admin";
 char configPassword[32] = "";
@@ -46,7 +46,23 @@ char configPassword[32] = "";
 #define DEBUGSERIAL
 // Open a super-insecure (but read-only) telnet debug port
 // #define DEBUGTELNET
+// If you have a motion sensor connected, define the pin here.  Leave set at "0" otherwise
+/********************/
+/* Bruh's  CODE     */
+/* Define Pins      */
+/********************/
+#define PIRPIN    D5
+#define DHTPIN    D1
+#define DHTTYPE   DHT22
 
+// And one binary_sensor for the (optional) motion tracker
+
+int pirValue;
+
+int pirStatus;
+
+String motionStatus;
+#include <DHT.h>
 #include <FS.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
@@ -111,20 +127,113 @@ String mqttLightBrightStateTopic;                // MQTT topic for outgoing pane
 String nextionModel;                             // Record reported model number of LCD panel
 const byte nextionSuffix[] = {0xFF, 0xFF, 0xFF}; // Standard suffix for Nextion commands
 long tftFileSize = 0;                            // Filesize for TFT firmware upload
+String mqttDiscoMotionStateTopic ;
+String mqttDiscoMotionConfigTopic ;
+String mqttDiscoMotionConfigPayload;
+String mqttDiscoTempStateTopic;
 
 // Additional CSS style to match Hass theme
 const char HASP_STYLE[] = "<style>button{background-color:#03A9F4;}body{width:60%;margin:auto;}</style>";
 // URL for auto-update "version.json"
-const char UPDATE_URL[] = "http://haswitchplate.com/update/version.json";
+const char UPDATE_URL[] = "";
 // Default link to compiled Arduino firmware image
-String espFirmwareUrl = "http://haswitchplate.com/update/HASwitchPlate.ino.d1_mini.bin";
+String espFirmwareUrl = "";
 // Default link to compiled Nextion firmware images
-String lcdFirmwareUrl = "http://haswitchplate.com/update/HASwitchPlate.tft";
+String lcdFirmwareUrl = "";
+String motionLatch;
+float diffTEMP = 0.2;
+float tempValue;
+float diffHUM = 1;
+float humValue;
+const int BUFFER_SIZE = 300;
+DHT dht(DHTPIN, DHTTYPE);
 
+bool checkBoundSensor(float newValue, float prevValue, float maxDiff) {
+
+  return newValue < prevValue - maxDiff || newValue > prevValue + maxDiff;
+
+}
+
+void sendState() {
+
+  StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
+  JsonObject& root = jsonBuffer.createObject();
+
+  root["humidity"] = (String)humValue;
+
+  root["temperature"] = (String)tempValue;
+
+  root["heatIndex"] = (String)calculateHeatIndex(humValue, tempValue);
+
+
+  char buffer[root.measureLength() + 1];
+
+  root.printTo(buffer, sizeof(buffer));
+
+
+
+  Serial.println(buffer);
+  debugPrintln(mqttDiscoTempStateTopic);
+  debugPrintln( buffer);
+  mqttClient.publish(mqttDiscoTempStateTopic, buffer);
+
+}
+
+
+
+
+
+/*
+
+ * Calculate Heat Index value AKA "Real Feel"
+
+ * NOAA heat index calculations taken from
+
+ * http://www.wpc.ncep.noaa.gov/html/heatindex_equation.shtml
+
+ */
+
+float calculateHeatIndex(float humidity, float temp) {
+
+  float heatIndex= 0;
+
+  if (temp >= 80) {
+
+    heatIndex = -42.379 + 2.04901523*temp + 10.14333127*humidity;
+
+    heatIndex = heatIndex - .22475541*temp*humidity - .00683783*temp*temp;
+
+    heatIndex = heatIndex - .05481717*humidity*humidity + .00122874*temp*temp*humidity;
+
+    heatIndex = heatIndex + .00085282*temp*humidity*humidity - .00000199*temp*temp*humidity*humidity;
+
+  } else {
+
+     heatIndex = 0.5 * (temp + 61.0 + ((temp - 68.0)*1.2) + (humidity * 0.094));
+
+  }
+
+
+
+  if (humidity < 13 && 80 <= temp <= 112) {
+
+     float adjustment = ((13-humidity)/4) * sqrt((17-abs(temp-95.))/17);
+
+     heatIndex = heatIndex - adjustment;
+
+  }
+
+
+
+  return heatIndex;
+
+}
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void setup()
 { // System setup
 
+  sendNextionCmd("dims=100");
+    sendNextionCmd("dim=100");
   Serial.begin(115200);  // Serial - LCD RX (after swap), debug TX
   Serial1.begin(115200); // Serial1 - LCD TX, no RX
 
@@ -132,6 +241,13 @@ void setup()
 
   sendNextionCmd("rest"); // reset the LCD
 
+/********************/
+/* Bruh's  CODE  */
+/* SETUP Pins       */
+/********************/
+  pinMode(PIRPIN, INPUT);
+  pinMode(DHTPIN, INPUT);
+   
   // Uncomment for testing, clears all saved settings on each boot
   //clearSavedConfig();
 
@@ -200,6 +316,44 @@ void loop()
     mqttConnect();
   }
 
+
+
+/********************/
+/* Bruh's PIR CODE  */
+/********************/
+
+
+    float newTempValue = dht.readTemperature(true); //to use celsius remove the true text inside the parentheses  
+    float newHumValue = dht.readHumidity();
+    
+    pirValue = digitalRead(PIRPIN); //read state of the
+   if (pirValue == LOW && pirStatus != 1) {
+
+    motionStatus = "standby";
+   //To be handled in HA ///
+      pirStatus = 1;
+    }
+    else if (pirValue == HIGH && pirStatus != 2) {
+    motionStatus = "motion detected";
+    //Tell HA motion was detected
+    sendNextionCmd("dim=100");
+    mqttClient.publish(mqttLightStateTopic, "ON");
+    pirStatus = 2;
+    }
+
+// Temprature Stuff
+    if (checkBoundSensor(newTempValue, tempValue, diffTEMP)) {
+      tempValue = newTempValue;
+      sendState();
+    }
+
+// Humidity Stuff
+    if (checkBoundSensor(newHumValue, humValue, diffHUM)) {
+      humValue = newHumValue;
+      sendState();
+    }
+
+
   mqttClient.loop();        // MQTT client loop
   ArduinoOTA.handle();      // Arduino OTA loop
   webServer.handleClient(); // webServer loop
@@ -218,22 +372,30 @@ void loop()
     mqttStatusUpdate();
   }
 
-  if (((millis() - updateCheckTimer) >= updateCheckInterval) || ((millis() >= startupDelayTimeBegin) && (millis() <= startupDelayTimeEnd) && startupDelayFlag))
-  { // Run periodic update check
-    updateCheckTimer = millis();
-    if (updateCheck())
-    { // If updateCheck hasn't returned an error, clear the startupDelay flag and update MQTT status
-      startupDelayFlag = false;
-      debugPrintln(F("UPDATE: Update check completed"));
-      mqttStatusUpdate();
+if (((millis() - updateCheckTimer) >= updateCheckInterval) || ((millis() >= startupDelayTimeBegin) && (millis() <= startupDelayTimeEnd) && startupDelayFlag))
+ { // Run periodic update check
+   updateCheckTimer = millis();
+  if (updateCheck())
+   { // If updateCheck hasn't returned an error, clear the startupDelay flag and update MQTT status
+     startupDelayFlag = false;
+   // debugPrintln(F("UPDATE: Update check completed"));
+     mqttStatusUpdate();
     }
+
+
+      
   }
+   
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Monitor motion sensor
 
 #ifdef DEBUGTELNET
   // telnetClient loop
   handleTelnetClient();
 #endif
-}
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Functions
@@ -266,11 +428,18 @@ void mqttConnect()
   mqttLightStateTopic = "hasp/" + String(haspNode) + "/light/status";
   mqttLightBrightCommandTopic = "hasp/" + String(haspNode) + "/brightness/set";
   mqttLightBrightStateTopic = "hasp/" + String(haspNode) + "/brightness/status";
+  mqttDiscoMotionStateTopic = "hasp/" + String(haspNode) +  "-motion/state";
+  mqttDiscoTempStateTopic = "hasp/" + String(haspNode) +  "-temp/sensor";
+  mqttDiscoMotionConfigTopic =  "hasp/" +  String(haspNode) + "-motion/config";
+  mqttDiscoMotionConfigPayload = "{\"name\": \"" + String(haspNode) + "-motion\", \"device_class\": \"motion\", \"state_topic\": \"" + mqttDiscoMotionStateTopic + "\"}";
 
   const String mqttCommandSubscription = mqttCommandTopic + "/#";
   const String mqttGroupCommandSubscription = mqttGroupCommandTopic + "/#";
   const String mqttLightSubscription = "hasp/" + String(haspNode) + "/light/#";
   const String mqttLightBrightSubscription = "hasp/" + String(haspNode) + "/brightness/#";
+
+
+
 
   // Loop until we're reconnected to MQTT
   while (!mqttClient.connected())
@@ -385,6 +554,11 @@ void mqttCallback(String &strTopic, String &strPayload)
 
   debugPrintln(String(F("MQTT IN:  '")) + strTopic + "' : '" + strPayload + "'");
 
+  if ((strTopic == (mqttCommandTopic + "/motionLatch")) && strPayload.toInt()) {
+    // ensure that we log the actual value of the conversion of the String payload to an integer
+    debugPrintln("MQTT CMD: setting motionLatch to " + String(strPayload.toInt()));
+    motionLatch = strPayload.toInt();
+  }
   if (((strTopic == mqttCommandTopic) || (strTopic == mqttGroupCommandTopic)) && (strPayload == ""))
   { // '[...]/device/command' -m '' = undefined
     // '[...]/group/command' -m '' = undefined
@@ -488,6 +662,8 @@ void mqttCallback(String &strTopic, String &strPayload)
   { // catch a dangling LWT from a previous connection if it appears
     mqttClient.publish(mqttStatusTopic, "ON");
   }
+
+  
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1226,7 +1402,7 @@ void webHandleNotFound()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void webHandleRoot()
-{ // http://plate01/
+{ // http://plate02/
   if (configPassword[0] != '\0')
   { //Request HTTP auth if configPassword is set
     if (!webServer.authenticate(configUser, configPassword))
@@ -1314,7 +1490,7 @@ void webHandleRoot()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void webHandleSaveConfig()
-{ // http://plate01/saveConfig
+{ // http://plate02/saveConfig
   if (configPassword[0] != '\0')
   { //Request HTTP auth if configPassword is set
     if (!webServer.authenticate(configUser, configPassword))
@@ -1408,7 +1584,7 @@ void webHandleSaveConfig()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void webHandleResetConfig()
-{ // http://plate01/resetConfig
+{ // http://plate02/resetConfig
   if (configPassword[0] != '\0')
   { //Request HTTP auth if configPassword is set
     if (!webServer.authenticate(configUser, configPassword))
@@ -1447,7 +1623,7 @@ void webHandleResetConfig()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void webHandleFirmware()
-{ // http://plate01/firmware
+{ // http://plate02/firmware
   if (configPassword[0] != '\0')
   { //Request HTTP auth if configPassword is set
     if (!webServer.authenticate(configUser, configPassword))
@@ -1526,7 +1702,7 @@ void webHandleFirmware()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void webHandleEspFirmware()
-{ // http://plate01/espfirmware
+{ // http://plate02/espfirmware
   if (configPassword[0] != '\0')
   { //Request HTTP auth if configPassword is set
     if (!webServer.authenticate(configUser, configPassword))
@@ -1555,7 +1731,7 @@ void webHandleEspFirmware()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void webHandleLcdUpload()
-{ // http://plate01/lcdupload
+{ // http://plate02/lcdupload
   // Upload firmware to the Nextion LCD via HTTP upload
 
   if (configPassword[0] != '\0')
@@ -1737,7 +1913,7 @@ void webHandleLcdUpload()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void webHandleLcdDownload()
-{ // http://plate01/lcddownload
+{ // http://plate02/lcddownload
   if (configPassword[0] != '\0')
   { //Request HTTP auth if configPassword is set
     if (!webServer.authenticate(configUser, configPassword))
@@ -1764,7 +1940,7 @@ void webHandleLcdDownload()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void webHandleTftFileSize()
-{ // http://plate01/tftFileSize
+{ // http://plate02/tftFileSize
   if (configPassword[0] != '\0')
   { //Request HTTP auth if configPassword is set
     if (!webServer.authenticate(configUser, configPassword))
@@ -1783,7 +1959,7 @@ void webHandleTftFileSize()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void webHandleReboot()
-{ // http://plate01/reboot
+{ // http:///reboot
   if (configPassword[0] != '\0')
   { //Request HTTP auth if configPassword is set
     if (!webServer.authenticate(configUser, configPassword))
@@ -1811,63 +1987,7 @@ void webHandleReboot()
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 bool updateCheck()
 { // firmware update check
-  HTTPClient updateClient;
-  debugPrintln(String(F("UPDATE: Checking update URL: ")) + String(UPDATE_URL));
-  String updatePayload;
-  updateClient.begin(UPDATE_URL);
-
-  // start connection and send HTTP header
-  int httpCode = updateClient.GET();
-
-  // httpCode will be negative on error
-  if (httpCode > 0)
-  {
-    // file found at server
-    if (httpCode == HTTP_CODE_OK)
-    {
-      updatePayload = updateClient.getString();
-    }
-  }
-  else
-  {
-    debugPrintln(String(F("UPDATE: Update check failed: ")) + updateClient.errorToString(httpCode));
-    return false;
-  }
-  updateClient.end();
-
-  DynamicJsonBuffer updateJsonBuffer(sizeof(updatePayload));
-
-  // Parse JSON object
-  JsonObject &updateJson = updateJsonBuffer.parseObject(updatePayload);
-  if (!updateJson.success())
-  {
-    debugPrintln(F("UPDATE: JSON parsing failed"));
-    return false;
-  }
-  else
-  {
-    if (updateJson["d1_mini"]["version"].success())
-    {
-      updateEspAvailableVersion = updateJson["d1_mini"]["version"].as<float>();
-      espFirmwareUrl = updateJson["d1_mini"]["firmware"].as<String>();
-      if (updateEspAvailableVersion > haspVersion)
-      {
-        updateEspAvailable = true;
-        debugPrintln(String(F("UPDATE: New ESP version available: ")) + String(updateEspAvailableVersion));
-      }
-    }
-    if (nextionModel && updateJson[nextionModel]["version"].success())
-    {
-      updateLcdAvailableVersion = updateJson[nextionModel]["version"].as<int>();
-      lcdFirmwareUrl = updateJson[nextionModel]["firmware"].as<String>();
-      if (updateLcdAvailableVersion > lcdVersion)
-      {
-        updateLcdAvailable = true;
-        debugPrintln(String(F("UPDATE: New LCD version available: ")) + String(updateLcdAvailableVersion));
-      }
-    }
-  }
-  return true;
+  return true ;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
